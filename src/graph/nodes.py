@@ -26,6 +26,7 @@ from src.llms.llm import get_llm_by_type
 from src.prompts.planner_model import Plan, StepType
 from src.prompts.template import apply_prompt_template
 from src.utils.json_utils import repair_json_output
+from src.utils.text_utils import remove_think_tags
 
 from .types import State
 from ..config import SELECTED_SEARCH_ENGINE, SearchEngine
@@ -119,10 +120,12 @@ def planner_node(
     if AGENT_LLM_MAP["planner"] == "basic":
         response = llm.invoke(messages)
         full_response = response.model_dump_json(indent=4, exclude_none=True)
+        full_response = remove_think_tags(full_response)
     else:
         response = llm.stream(messages)
         for chunk in response:
             full_response += chunk.content
+        full_response = remove_think_tags(full_response)
     logger.debug(f"Current state messages: {state['messages']}")
     logger.info(f"Planner response: {full_response}")
 
@@ -280,6 +283,7 @@ def reporter_node(state: State):
     logger.debug(f"Current invoke messages: {invoke_messages}")
     response = get_llm_by_type(AGENT_LLM_MAP["reporter"]).invoke(invoke_messages)
     response_content = response.content
+    response_content = remove_think_tags(response_content)
     logger.info(f"reporter response: {response_content}")
 
     return {"final_report": response_content}
@@ -383,6 +387,7 @@ async def _execute_agent_step(
 
     # Process the result
     response_content = result["messages"][-1].content
+    response_content = remove_think_tags(response_content)
     logger.debug(f"{agent_name.capitalize()} full response: {response_content}")
 
     # Update the step with the execution result
