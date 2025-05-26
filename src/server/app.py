@@ -6,6 +6,8 @@ import json
 import logging
 import os
 from typing import List, cast
+import uuid
+import time
 from uuid import uuid4
 
 from fastapi import FastAPI, HTTPException
@@ -25,6 +27,19 @@ from src.server.chat_request import (
     GeneratePPTRequest,
     GenerateProseRequest,
     TTSRequest,
+)
+from src.server.openai_models import (
+    OpenAIChatCompletionRequest,
+    OpenAIChatCompletionResponse,
+    OpenAIChatMessageOutput,
+    OpenAIChatCompletionChoice,
+    OpenAIUsage,
+    OpenAIMessage,
+    OpenAIChatCompletionChunk,
+    OpenAIChatCompletionStreamChoice,
+    OpenAIChatCompletionChoiceDelta,
+    OpenAIError,
+    OpenAIErrorDetail,
 )
 from src.server.mcp_request import MCPServerMetadataRequest, MCPServerMetadataResponse
 from src.server.mcp_utils import load_mcp_tools
@@ -319,3 +334,170 @@ async def mcp_server_metadata(request: MCPServerMetadataRequest):
             logger.exception(f"Error in MCP server metadata endpoint: {str(e)}")
             raise HTTPException(status_code=500, detail=str(e))
         raise
+
+
+@app.post("/v1/chat/completions", response_model=OpenAIChatCompletionResponse)
+async def openai_chat_completions(request: OpenAIChatCompletionRequest):
+    """
+    OpenAI API compatible endpoint for chat completions.
+
+    This endpoint mimics the behavior of OpenAI's `/v1/chat/completions`
+    and supports both streaming and non-streaming responses.
+    The `model` parameter in the request is used to determine the model for the response,
+    but the underlying graph execution is currently fixed.
+    Token counts in the response (`usage` field) are placeholders (0) and not accurately
+    calculated by this endpoint.
+    """
+    try:
+        if not request.stream:
+            response_id = f"chatcmpl-{uuid.uuid4().hex}"
+            created_timestamp = int(time.time())
+
+            transformed_messages: List[ChatMessage] = []
+            for msg in request.messages:
+                transformed_messages.append(ChatMessage(role=msg.role, content=msg.content))
+
+            graph_input = {
+                "messages": transformed_messages,
+                "plan_iterations": 0,  # Default value
+                "final_report": "",
+                "current_plan": None,
+                "observations": [],
+                "auto_accepted_plan": True,  # Assuming auto-acceptance for API
+                "enable_background_investigation": True,  # Default value
+            }
+            thread_id = str(uuid.uuid4())
+
+            config = {
+                "thread_id": thread_id,
+                "max_plan_iterations": 1,
+                "max_step_num": 3,
+                "max_search_results": 3,
+                "mcp_settings": {},
+            }
+
+            final_state = await graph.ainvoke(graph_input, config=config)
+            full_assistant_content = final_state.get("final_report", "Error: Could not retrieve final report.")
+
+            message = OpenAIChatMessageOutput(role="assistant", content=full_assistant_content)
+            choice = OpenAIChatCompletionChoice(index=0, message=message, finish_reason="stop")
+            usage = OpenAIUsage(prompt_tokens=0, completion_tokens=0, total_tokens=0) # Placeholder
+            
+            return OpenAIChatCompletionResponse(
+                id=response_id,
+                object="chat.completion",
+                created=created_timestamp,
+                model=request.model,
+                choices=[choice],
+                usage=usage,
+            )
+        elif request.stream:
+            stream_id = f"chatcmpl-{uuid.uuid4().hex}"
+            created_timestamp = int(time.time())
+
+            transformed_messages: List[ChatMessage] = []
+            for msg in request.messages:
+                transformed_messages.append(ChatMessage(role=msg.role, content=msg.content))
+
+            graph_input = {
+                "messages": transformed_messages,
+                "plan_iterations": 0,
+                "final_report": "",
+                "current_plan": None,
+                "observations": [],
+                "auto_accepted_plan": True,
+                "enable_background_investigation": True,
+            }
+            thread_id = str(uuid.uuid4())
+            
+            config = {
+                "thread_id": thread_id,
+                "max_plan_iterations": 1,
+                "max_step_num": 3,
+                "max_search_results": 3,
+                "mcp_settings": {},
+            }
+
+            return StreamingResponse(
+                _openai_stream_generator(
+                    graph_input, thread_id, request.model, stream_id, created_timestamp, config
+                ),
+                media_type="text/event-stream",
+            )
+        else:
+            # Should not happen if request.stream is a boolean
+            raise HTTPException(status_code=400, detail="Invalid request format")
+    except HTTPException as he:
+        # Re-raise HTTPExceptions directly to let FastAPI handle them
+        raise he
+    except Exception as e:
+        logger.error(f"Error in OpenAI /v1/chat/completions endpoint: {e}", exc_info=True)
+        error_detail_obj = OpenAIErrorDetail(type="internal_server_error", message=str(e))
+        openai_error_obj = OpenAIError(error=error_detail_obj)
+        raise HTTPException(status_code=500, detail=openai_error_obj.model_dump(exclude_none=True))
+
+async def _openai_stream_generator(
+    graph_input: dict, thread_id: str, model_name: str, stream_id: str, created_timestamp: int, config: dict
+):
+    """
+    Asynchronous generator for OpenAI compatible streaming responses.
+    """
+    try:
+        # Yield the first chunk (role definition)
+        first_delta = OpenAIChatCompletionChoiceDelta(role="assistant", content="")
+        first_choice = OpenAIChatCompletionStreamChoice(index=0, delta=first_delta, finish_reason=None)
+        first_chunk = OpenAIChatCompletionChunk(
+            id=stream_id, 
+            object="chat.completion.chunk", 
+            created=created_timestamp, 
+            model=model_name, 
+            choices=[first_choice]
+        )
+        yield f"data: {json.dumps(first_chunk.model_dump(exclude_none=True))}\n\n"
+
+        async for agent, _, event_data in graph.astream(
+            graph_input,
+            config=config,
+            stream_mode=["messages", "updates"], 
+            subgraphs=True, 
+        ):
+            if isinstance(event_data, tuple) and len(event_data) > 0:
+                message_chunk = event_data[0]
+                if isinstance(message_chunk, AIMessageChunk) and message_chunk.content:
+                    if message_chunk.content: 
+                        delta = OpenAIChatCompletionChoiceDelta(content=str(message_chunk.content))
+                        choice = OpenAIChatCompletionStreamChoice(index=0, delta=delta, finish_reason=None)
+                        chunk = OpenAIChatCompletionChunk(
+                            id=stream_id,
+                            object="chat.completion.chunk",
+                            created=created_timestamp,
+                            model=model_name,
+                            choices=[choice],
+                        )
+                        yield f"data: {json.dumps(chunk.model_dump(exclude_none=True))}\n\n"
+        
+        # Yield the final chunk
+        final_delta = OpenAIChatCompletionChoiceDelta() 
+        final_choice = OpenAIChatCompletionStreamChoice(index=0, delta=final_delta, finish_reason="stop")
+        final_chunk = OpenAIChatCompletionChunk(
+            id=stream_id, 
+            object="chat.completion.chunk", 
+            created=created_timestamp, 
+            model=model_name, 
+            choices=[final_choice]
+        )
+        yield f"data: {json.dumps(final_chunk.model_dump(exclude_none=True))}\n\n"
+        yield "data: [DONE]\n\n"
+
+    except Exception as e:
+        logger.error(f"Error during OpenAI stream generation: {str(e)}", exc_info=True)
+        # Cannot yield an HTTPException or change status code mid-stream easily.
+        # The stream will likely terminate, and the client will have to handle it.
+        # For demonstration, one could attempt to yield a custom error message in the stream if the protocol allowed:
+        # error_detail_obj = OpenAIErrorDetail(type="stream_error", message=str(e))
+        # openai_error_obj = OpenAIError(error=error_detail_obj)
+        # yield f"data: {json.dumps({'error': openai_error_obj.model_dump(exclude_none=True)})}\n\n"
+        # However, this isn't standard OpenAI SSE error handling. The stream will just break.
+        # Ensure the DONE message isn't sent if an error occurs.
+        # The try/except here is mostly for server-side logging of the broken stream.
+        pass # Let the stream terminate.
